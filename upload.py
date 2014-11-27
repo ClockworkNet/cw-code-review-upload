@@ -83,11 +83,11 @@ LOGGER = logging.getLogger('upload')
 # The account type used for authentication.
 # This line could be changed by the review server (see handler for
 # upload.py).
-AUTH_ACCOUNT_TYPE = "GOOGLE"
+AUTH_ACCOUNT_TYPE = "HOSTED"
 
 # URL of the default review server. As for AUTH_ACCOUNT_TYPE, this line could be
 # changed by the review server (see handler for upload.py).
-DEFAULT_REVIEW_SERVER = "codereview.appspot.com"
+DEFAULT_REVIEW_SERVER = "codereview.clockwork.net"
 
 # Max size of patch or base file.
 MAX_UPLOAD_SIZE = 900 * 1024
@@ -701,7 +701,20 @@ group.add_option("--p4_client", action="store", dest="p4_client",
 group.add_option("--p4_user", action="store", dest="p4_user",
                  metavar="P4_USER", default=None,
                  help=("Perforce user"))
+# SVN specific
+group = parser.add_option_group("SVN-specific options")
+group.add_option("--svn_explicit_branches", action="store_true", dest="svn_explicit_branches",
+                 default=False,
+                 help="Use explicit bases for svn diff source and target. Use "
+                      "--svn-source=URL/path@rev1 --svn-target=URL/path@rev2")
 
+group.add_option( "--svn_source", action="store", dest="svn_source",
+                 default=None,
+                 help="Source svn URL to diff against" )
+
+group.add_option( "--svn_target", action="store", dest="svn_target",
+                 default=None,
+                 help="Target svn URL to diff against" )
 
 # OAuth 2.0 Methods and Helpers
 class ClientRedirectServer(BaseHTTPServer.HTTPServer):
@@ -1160,6 +1173,8 @@ class VersionControlSystem(object):
         type = "base"
       else:
         type = "current"
+      if is_binary:
+        return "Not uploading binary files."
       if len(content) > MAX_UPLOAD_SIZE:
         result = ("Not uploading the %s file for %s because it's too large." %
             (type, filename))
@@ -1238,28 +1253,50 @@ class SubversionVCS(VersionControlSystem):
 
   def __init__(self, options):
     super(SubversionVCS, self).__init__(options)
-    if self.options.revision:
-      match = re.match(r"(\d+)(:(\d+))?", self.options.revision)
-      if not match:
-        ErrorExit("Invalid Subversion revision %s." % self.options.revision)
-      self.rev_start = match.group(1)
-      self.rev_end = match.group(3)
+    LOGGER.info("setting up subversion.")
+    if self.options.svn_explicit_branches:
+      LOGGER.info("svn explicit branches.")
+      if self.options.svn_source:
+        match = re.match(r"([^@]+)(@(.+))?", self.options.svn_source)
+        self.svn_source_url = match.group(1)
+        self.rev_start = match.group(3) or "HEAD"
+
+      if self.options.svn_target:
+        match = re.match(r"([^@]+)(@(.+))?", self.options.svn_target)
+        self.svn_target_url = match.group(1)
+        self.rev_end = match.group(3) or "HEAD"
     else:
-      self.rev_start = self.rev_end = None
+      if self.options.revision:
+        match = re.match(r"(\d+)(:(\d+))?", self.options.revision)
+        if not match:
+          ErrorExit("Invalid Subversion revision %s." % self.options.revision)
+        self.rev_start = match.group(1)
+        self.rev_end = match.group(3)
+      else:
+        self.rev_start = self.rev_end = None
     # Cache output from "svn list -r REVNO dirname".
     # Keys: dirname, Values: 2-tuple (ouput for start rev and end rev).
     self.svnls_cache = {}
     # Base URL is required to fetch files deleted in an older revision.
     # Result is cached to not guess it over and over again in GetBaseFile().
     required = self.options.download_base or self.options.revision is not None
-    self.svn_base = self._GuessBase(required)
+
+    LOGGER.info(required)
+
+    if self.options.svn_explicit_branches:
+      self.svn_base = self.svn_source_url
+    else:
+      self.svn_base = self._GuessBase(required)
 
   def GetGUID(self):
     return self._GetInfo("Repository UUID")
 
   def GuessBase(self, required):
     """Wrapper for _GuessBase."""
-    return self.svn_base
+    if self.options.svn_explicit_branches:
+      return self.svn_source_url
+    else:
+      return self.svn_base
 
   def _GuessBase(self, required):
     """Returns base URL for current diff.
@@ -1291,7 +1328,11 @@ class SubversionVCS(VersionControlSystem):
 
   def _GetInfo(self, key):
     """Parses 'svn info' for current dir. Returns value for key or None"""
-    for line in RunShell(["svn", "info"]).splitlines():
+    if self.options.svn_explicit_branches:
+      cmd = ["svn", "info", self.svn_source_url ]
+    else:
+      cmd = ["svn", "info"]
+    for line in RunShell(cmd).splitlines():
       if line.startswith(key + ": "):
         return line.split(":", 1)[1].strip()
 
@@ -1303,9 +1344,15 @@ class SubversionVCS(VersionControlSystem):
 
   def GenerateDiff(self, args):
     cmd = ["svn", "diff"]
-    if self.options.revision:
-      cmd += ["-r", self.options.revision]
-    cmd.extend(args)
+
+    if self.options.svn_explicit_branches:
+      cmd += [self.svn_source_url + "@" + self.rev_start]
+      cmd += [self.svn_target_url + "@" + self.rev_end]
+    else:
+      if self.options.revision:
+        cmd += ["-r", self.options.revision]
+      cmd.extend(args)
+
     data = RunShell(cmd)
     count = 0
     for line in data.splitlines():
@@ -1367,7 +1414,7 @@ class SubversionVCS(VersionControlSystem):
 
   def GetStatus(self, filename):
     """Returns the status of a file."""
-    if not self.options.revision:
+    if not self.options.revision and not self.options.svn_explicit_branches:
       status = RunShell(["svn", "status", "--ignore-externals",
                          self._EscapeFilename(filename)])
       if not status:
@@ -1388,10 +1435,28 @@ class SubversionVCS(VersionControlSystem):
     else:
       dirname, relfilename = os.path.split(filename)
       if dirname not in self.svnls_cache:
-        cmd = ["svn", "list", "-r", self.rev_start,
-               self._EscapeFilename(dirname) or "."]
+
+        if self.options.svn_explicit_branches:
+          separator = "" if dirname.startswith( "/" ) else "/"
+          cmd = [
+          "svn",
+          "list",
+          self.svn_source_url + separator + dirname + "@" + self.rev_start or "."
+        ]
+        else:
+          cmd = [
+            "svn",
+            "list",
+            "-r",
+            self.rev_start,
+            self._EscapeFilename(dirname) or "."
+          ]
         out, err, returncode = RunShellWithReturnCodeAndStderr(cmd)
         if returncode:
+          if self.options.svn_explicit_branches:
+            # a new directory in the target branch makes a file appear to be present in the target branch only
+            status = "A   "
+            return status
           # Directory might not yet exist at start revison
           # svn: Unable to find repository location for 'abc' in revision nnn
           if re.match('^svn: Unable to find repository location for .+ in revision \d+', err):
@@ -1403,7 +1468,11 @@ class SubversionVCS(VersionControlSystem):
         args = ["svn", "list"]
         if self.rev_end:
           args += ["-r", self.rev_end]
-        cmd = args + [self._EscapeFilename(dirname) or "."]
+
+        if self.options.svn_explicit_branches:
+          cmd = args + [self.svn_source_url + separator + dirname + "@" + self.rev_start or "."]
+        else:
+          cmd = args + [self._EscapeFilename(dirname) or "."]
         out, returncode = RunShellWithReturnCode(cmd)
         if returncode:
           ErrorExit("Failed to run command %s" % cmd)
@@ -1429,17 +1498,36 @@ class SubversionVCS(VersionControlSystem):
     if status[0] == "A" and status[3] != "+":
       # We'll need to upload the new content if we're adding a binary file
       # since diff's output won't contain it.
-      mimetype = RunShell(["svn", "propget", "svn:mime-type",
-                           self._EscapeFilename(filename)], silent_ok=True)
+      if self.options.svn_explicit_branches:
+        mimetype = RunShell(
+          [
+            "svn",
+            "propget",
+            "svn:mime-type",
+            self.svn_target_url + "/" + filename + "@" + self.rev_end
+          ],
+          silent_ok=True
+        )
+      else:
+        mimetype = RunShell(["svn", "propget", "svn:mime-type",
+                             self._EscapeFilename(filename)], silent_ok=True)
       base_content = ""
       is_binary = bool(mimetype) and not mimetype.startswith("text/")
       if is_binary:
-        new_content = self.ReadFile(filename)
+        try:
+          new_content = self.ReadFile(filename)
+        except IOError:
+          # Ignore missing local image file (this can happen if the source rev
+          # is not HEAD)
+          pass
     elif (status[0] in ("M", "D", "R") or
           (status[0] == "A" and status[3] == "+") or  # Copied file.
           (status[0] == " " and status[1] == "M")):  # Property change.
       args = []
-      if self.options.revision:
+
+      if self.options.svn_explicit_branches:
+        url = "%s/%s@%s" % (self.svn_source_url, filename, self.rev_start)
+      elif self.options.revision:
         # filename must not be escaped. We already add an ampersand here.
         url = "%s/%s@%s" % (self.svn_base, filename, self.rev_start)
       else:
@@ -1481,7 +1569,12 @@ class SubversionVCS(VersionControlSystem):
           universal_newlines = False
         else:
           universal_newlines = True
-        if self.rev_start:
+        if self.options.svn_explicit_branches:
+          url = "%s/%s@%s" % (self.svn_source_url, filename, self.rev_start)
+          base_content = RunShell(["svn", "cat", url],
+                                  universal_newlines=universal_newlines,
+                                  silent_ok=True)
+        elif self.rev_start:
           # "svn cat -r REV delete_file.txt" doesn't work. cat requires
           # the full URL with "@REV" appended instead of using "-r" option.
           url = "%s/%s@%s" % (self.svn_base, filename, self.rev_start)
@@ -2358,6 +2451,9 @@ def GuessVCS(options):
     if v is None:
       ErrorExit("Unknown version control system %r specified." % vcs)
     (vcs, extra_output) = (v, None)
+  elif options.svn_explicit_branches:
+    v = VCS_ABBREVIATIONS.get('svn')
+    (vcs, extra_output) = (v, None)
   else:
     (vcs, extra_output) = GuessVCSName(options)
 
@@ -2540,6 +2636,8 @@ def RealMain(argv, data=None):
 
   vcs = GuessVCS(options)
 
+  LOGGER.info(vcs)
+
   base = options.base_url
   if isinstance(vcs, SubversionVCS):
     # Guessing the base field is only supported for Subversion.
@@ -2579,6 +2677,8 @@ def RealMain(argv, data=None):
                             options.open_oauth2_local_webbrowser)
   form_fields = []
 
+  LOGGER.info("about to get the repo_guid")
+
   repo_guid = vcs.GetGUID()
   if repo_guid:
     form_fields.append(("repo_guid", repo_guid))
@@ -2602,6 +2702,8 @@ def RealMain(argv, data=None):
     for cc in options.cc.split(','):
       CheckReviewer(cc)
     form_fields.append(("cc", options.cc))
+
+  LOGGER.info("about to get the message")
 
   # Process --message, --title and --file.
   message = options.message or ""
