@@ -55,6 +55,7 @@ import urlparse
 import webbrowser
 
 from multiprocessing.pool import ThreadPool
+from pprint import pformat
 
 # The md5 module was deprecated in Python 2.5.
 try:
@@ -87,7 +88,7 @@ AUTH_ACCOUNT_TYPE = "HOSTED"
 
 # URL of the default review server. As for AUTH_ACCOUNT_TYPE, this line could be
 # changed by the review server (see handler for upload.py).
-DEFAULT_REVIEW_SERVER = "codereview.clockwork.net"
+DEFAULT_REVIEW_SERVER = "localhost:8080"
 
 # Max size of patch or base file.
 MAX_UPLOAD_SIZE = 900 * 1024
@@ -480,6 +481,14 @@ class AbstractRpcServer(object):
           elif e.code >= 500:
             # TODO: We should error out on a 500, but the server is too flaky
             # for that at the moment.
+
+            #LOGGER.error("request_path: {}".format(request_path))
+            #LOGGER.error("payload: {}".format(payload))
+            #LOGGER.error("args: {}".format(args))
+            #LOGGER.error("extra_headers: {}".format(extra_headers))
+            #LOGGER.error("content_type: {}".format(content_type))
+            #LOGGER.error("e.reason: {}".format(e.reason))
+
             StatusUpdate('Upload got a 500 response: %d' % e.code)
           else:
             raise
@@ -1173,8 +1182,6 @@ class VersionControlSystem(object):
         type = "base"
       else:
         type = "current"
-      if is_binary:
-        return "Not uploading binary files."
       if len(content) > MAX_UPLOAD_SIZE:
         result = ("Not uploading the %s file for %s because it's too large." %
             (type, filename))
@@ -1201,6 +1208,8 @@ class VersionControlSystem(object):
       except urllib2.HTTPError, e:
         response_body = ("Failed to upload file for %s. Got %d status code." %
             (filename, e.code))
+        LOGGER.error("Failed to upload file for %s. Got %d status code." %
+            (filename, e.code));
 
       if not response_body.startswith("OK"):
         StatusUpdate("  --> %s" % response_body)
@@ -1215,17 +1224,37 @@ class VersionControlSystem(object):
     thread_pool = ThreadPool(options.num_upload_threads)
 
     for filename in patches.keys():
+
       base_content, new_content, is_binary, status = files[filename]
+
+      LOGGER.info("Working on {}".format(filename))
+      #LOGGER.info("   base_content {}".format(base_content))
+      #LOGGER.info("   new_content {}".format(new_content))
+      #LOGGER.info("   is_binary {}".format(is_binary))
+      #LOGGER.info("   status {}".format(status))
+
       file_id_str = patches.get(filename)
       if file_id_str.find("nobase") != -1:
         base_content = None
         file_id_str = file_id_str[file_id_str.rfind("_") + 1:]
       file_id = int(file_id_str)
       if base_content != None:
+        LOGGER.info(
+          "Uploading base content for {} ({})".format(
+            filename,
+            len(base_content)
+          )
+        )
         t = thread_pool.apply_async(UploadFile, args=(filename,
             file_id, base_content, is_binary, status, True))
         threads.append(t)
       if new_content != None:
+        LOGGER.info(
+          "Uploading new content for {} ({})".format(
+            filename,
+            len(new_content)
+          )
+        )
         t = thread_pool.apply_async(UploadFile, args=(filename,
             file_id, new_content, is_binary, status, False))
         threads.append(t)
@@ -1253,9 +1282,7 @@ class SubversionVCS(VersionControlSystem):
 
   def __init__(self, options):
     super(SubversionVCS, self).__init__(options)
-    LOGGER.info("setting up subversion.")
     if self.options.svn_explicit_branches:
-      LOGGER.info("svn explicit branches.")
       if self.options.svn_source:
         match = re.match(r"([^@]+)(@(.+))?", self.options.svn_source)
         self.svn_source_url = match.group(1)
@@ -1281,8 +1308,6 @@ class SubversionVCS(VersionControlSystem):
     # Result is cached to not guess it over and over again in GetBaseFile().
     required = self.options.download_base or self.options.revision is not None
 
-    LOGGER.info(required)
-
     if self.options.svn_explicit_branches:
       self.svn_base = self.svn_source_url
     else:
@@ -1290,6 +1315,15 @@ class SubversionVCS(VersionControlSystem):
 
   def GetGUID(self):
     return self._GetInfo("Repository UUID")
+
+  # def GetBaseFiles(self, diff):
+  #   files =  super(SubversionVCS, self).GetBaseFiles(diff)
+  #   if self.options.svn_explicit_branches:
+  #     LOGGER.info(
+  #       "Filtering out the binary files because of the svn_explicit_branches flag."
+  #     )
+  #     files = {filename:fileinfo for (filename, fileinfo) in files.iteritems() if not fileinfo[2]}
+  #   return files
 
   def GuessBase(self, required):
     """Wrapper for _GuessBase."""
@@ -1435,13 +1469,17 @@ class SubversionVCS(VersionControlSystem):
     else:
       dirname, relfilename = os.path.split(filename)
       if dirname not in self.svnls_cache:
-
         if self.options.svn_explicit_branches:
           separator = "" if dirname.startswith( "/" ) else "/"
           cmd = [
           "svn",
           "list",
-          self.svn_source_url + separator + dirname + "@" + self.rev_start or "."
+          "{0}{1}{2}@{3}".format(
+            self.svn_source_url,
+            separator,
+            self._EscapeFilename(dirname),
+            self.rev_start or "."
+          )
         ]
         else:
           cmd = [
@@ -1454,7 +1492,8 @@ class SubversionVCS(VersionControlSystem):
         out, err, returncode = RunShellWithReturnCodeAndStderr(cmd)
         if returncode:
           if self.options.svn_explicit_branches:
-            # a new directory in the target branch makes a file appear to be present in the target branch only
+            # a new directory in the target branch makes a file appear to be
+            # present in the target branch only.
             status = "A   "
             return status
           # Directory might not yet exist at start revison
@@ -1466,17 +1505,26 @@ class SubversionVCS(VersionControlSystem):
         else:
           old_files = out.splitlines()
         args = ["svn", "list"]
+
         if self.rev_end:
           args += ["-r", self.rev_end]
-
-        if self.options.svn_explicit_branches:
-          cmd = args + [self.svn_source_url + separator + dirname + "@" + self.rev_start or "."]
+        elif self.options.svn_explicit_branches:
+          cmd = args + [
+            "{url}{separator}{dir}@{rev}".format(
+              url=self.svn_target_url,
+              separator=separator,
+              dir=dirname,
+              rev=self.rev_end or "."
+            )
+          ]
         else:
           cmd = args + [self._EscapeFilename(dirname) or "."]
+
         out, returncode = RunShellWithReturnCode(cmd)
         if returncode:
           ErrorExit("Failed to run command %s" % cmd)
-        self.svnls_cache[dirname] = (old_files, out.splitlines())
+        new_files = out.splitlines()
+        self.svnls_cache[dirname] = (old_files, new_files)
       old_files, new_files = self.svnls_cache[dirname]
       if relfilename in old_files and relfilename not in new_files:
         status = "D   "
@@ -1509,16 +1557,48 @@ class SubversionVCS(VersionControlSystem):
           silent_ok=True
         )
       else:
-        mimetype = RunShell(["svn", "propget", "svn:mime-type",
-                             self._EscapeFilename(filename)], silent_ok=True)
+        mimetype = RunShell(
+          [
+            "svn",
+            "propget",
+            "svn:mime-type",
+            self._EscapeFilename(filename)
+          ],
+          silent_ok=True
+        )
       base_content = ""
+
       is_binary = bool(mimetype) and not mimetype.startswith("text/")
-      if is_binary:
+
+      if is_binary and self.options.svn_explicit_branches:
+        base_content, err, returncode = RunShellWithReturnCodeAndStderr(
+          [
+            "svn",
+            "cat",
+            self.svn_source_url + "/" + filename + "@" + self.rev_start
+          ]
+        )
+
+        LOGGER.info("base_content: {}".format(base_content))
+
+        new_content, err, returncode = RunShellWithReturnCodeAndStderr(
+          [
+            "svn",
+            "cat",
+            self.svn_target_url + "/" + filename + "@" + self.rev_end
+          ]
+        )
+      elif is_binary:
         try:
           new_content = self.ReadFile(filename)
         except IOError:
           # Ignore missing local image file (this can happen if the source rev
           # is not HEAD)
+          LOGGER.info(
+            "Ignoring missing local image file {filename}".format(
+              filename=filename
+            )
+          )
           pass
     elif (status[0] in ("M", "D", "R") or
           (status[0] == "A" and status[3] == "+") or  # Copied file.
@@ -1564,12 +1644,15 @@ class SubversionVCS(VersionControlSystem):
       else:
         get_base = True
 
+      LOGGER.info("get_base: {}".format(get_base))
+
       if get_base:
         if is_binary:
           universal_newlines = False
         else:
           universal_newlines = True
-        if self.options.svn_explicit_branches:
+
+        if self.options.svn_explicit_branches and not is_binary:
           url = "%s/%s@%s" % (self.svn_source_url, filename, self.rev_start)
           base_content = RunShell(["svn", "cat", url],
                                   universal_newlines=universal_newlines,
@@ -1608,6 +1691,9 @@ class SubversionVCS(VersionControlSystem):
     else:
       StatusUpdate("svn status returned unexpected output: %s" % status)
       sys.exit(1)
+
+    #LOGGER.info(pformat((base_content, new_content, is_binary, status[0:5])))
+
     return base_content, new_content, is_binary, status[0:5]
 
 
@@ -2348,6 +2434,7 @@ def UploadSeparatePatches(issue, rpc_server, patchset, data, options):
   thread_pool = ThreadPool(options.num_upload_threads)
 
   patches = SplitPatch(data)
+
   rv = []
   for patch in patches:
     if len(patch[1]) > MAX_UPLOAD_SIZE:
@@ -2357,6 +2444,9 @@ def UploadSeparatePatches(issue, rpc_server, patchset, data, options):
 
     filename = patch[0]
     data = patch[1]
+
+    # LOGGER.info("filename: {}".format(filename))
+    # LOGGER.info("data: {}".format(data))
 
     t = thread_pool.apply_async(UploadFile, args=(filename, data))
     threads.append(t)
@@ -2663,6 +2753,7 @@ def RealMain(argv, data=None):
     print data
     print "Rietveld diff end:*****"
   files = vcs.GetBaseFiles(data)
+
   if verbosity >= 1:
     print "Upload server:", options.server, "(change with -s/--server)"
   if options.use_oauth2:
@@ -2676,8 +2767,6 @@ def RealMain(argv, data=None):
                             options.oauth2_port,
                             options.open_oauth2_local_webbrowser)
   form_fields = []
-
-  LOGGER.info("about to get the repo_guid")
 
   repo_guid = vcs.GetGUID()
   if repo_guid:
@@ -2702,8 +2791,6 @@ def RealMain(argv, data=None):
     for cc in options.cc.split(','):
       CheckReviewer(cc)
     form_fields.append(("cc", options.cc))
-
-  LOGGER.info("about to get the message")
 
   # Process --message, --title and --file.
   message = options.message or ""
@@ -2786,6 +2873,14 @@ def RealMain(argv, data=None):
       patches = result
 
   if not options.download_base:
+
+    # LOGGER.info("issue: {}".format(issue))
+    # LOGGER.info("rpc_server: {}".format(rpc_server))
+    # LOGGER.info("patches: {}".format(patches))
+    # LOGGER.info("patchset: {}".format(patchset))
+    # LOGGER.info("options: {}".format(options))
+    # LOGGER.info("files: {}".format(files))
+
     vcs.UploadBaseFiles(issue, rpc_server, patches, patchset, options, files)
 
   payload = {}  # payload for final request
@@ -2795,9 +2890,14 @@ def RealMain(argv, data=None):
       payload["attach_patch"] = "yes"
   if options.issue and message:
     payload["message"] = message
+
+  LOGGER.info("payload: {}".format(payload))
+  LOGGER.info("patchset: {}".format(patchset))
+
   payload = urllib.urlencode(payload)
-  rpc_server.Send("/" + issue + "/upload_complete/" + (patchset or ""),
+  response = rpc_server.Send("/" + issue + "/upload_complete/" + (patchset or ""),
                   payload=payload)
+
   return issue, patchset
 
 
