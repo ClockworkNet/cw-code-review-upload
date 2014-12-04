@@ -88,6 +88,7 @@ AUTH_ACCOUNT_TYPE = "HOSTED"
 
 # URL of the default review server. As for AUTH_ACCOUNT_TYPE, this line could be
 # changed by the review server (see handler for upload.py).
+#DEFAULT_REVIEW_SERVER = "codereview.clockwork.net"
 DEFAULT_REVIEW_SERVER = "localhost:8080"
 
 # Max size of patch or base file.
@@ -481,14 +482,6 @@ class AbstractRpcServer(object):
           elif e.code >= 500:
             # TODO: We should error out on a 500, but the server is too flaky
             # for that at the moment.
-
-            #LOGGER.error("request_path: {}".format(request_path))
-            #LOGGER.error("payload: {}".format(payload))
-            #LOGGER.error("args: {}".format(args))
-            #LOGGER.error("extra_headers: {}".format(extra_headers))
-            #LOGGER.error("content_type: {}".format(content_type))
-            #LOGGER.error("e.reason: {}".format(e.reason))
-
             StatusUpdate('Upload got a 500 response: %d' % e.code)
           else:
             raise
@@ -1227,34 +1220,16 @@ class VersionControlSystem(object):
 
       base_content, new_content, is_binary, status = files[filename]
 
-      LOGGER.info("Working on {}".format(filename))
-      #LOGGER.info("   base_content {}".format(base_content))
-      #LOGGER.info("   new_content {}".format(new_content))
-      #LOGGER.info("   is_binary {}".format(is_binary))
-      #LOGGER.info("   status {}".format(status))
-
       file_id_str = patches.get(filename)
       if file_id_str.find("nobase") != -1:
         base_content = None
         file_id_str = file_id_str[file_id_str.rfind("_") + 1:]
       file_id = int(file_id_str)
       if base_content != None:
-        LOGGER.info(
-          "Uploading base content for {} ({})".format(
-            filename,
-            len(base_content)
-          )
-        )
         t = thread_pool.apply_async(UploadFile, args=(filename,
             file_id, base_content, is_binary, status, True))
         threads.append(t)
       if new_content != None:
-        LOGGER.info(
-          "Uploading new content for {} ({})".format(
-            filename,
-            len(new_content)
-          )
-        )
         t = thread_pool.apply_async(UploadFile, args=(filename,
             file_id, new_content, is_binary, status, False))
         threads.append(t)
@@ -1316,15 +1291,6 @@ class SubversionVCS(VersionControlSystem):
   def GetGUID(self):
     return self._GetInfo("Repository UUID")
 
-  # def GetBaseFiles(self, diff):
-  #   files =  super(SubversionVCS, self).GetBaseFiles(diff)
-  #   if self.options.svn_explicit_branches:
-  #     LOGGER.info(
-  #       "Filtering out the binary files because of the svn_explicit_branches flag."
-  #     )
-  #     files = {filename:fileinfo for (filename, fileinfo) in files.iteritems() if not fileinfo[2]}
-  #   return files
-
   def GuessBase(self, required):
     """Wrapper for _GuessBase."""
     if self.options.svn_explicit_branches:
@@ -1377,7 +1343,7 @@ class SubversionVCS(VersionControlSystem):
     return filename
 
   def GenerateDiff(self, args):
-    cmd = ["svn", "diff"]
+    cmd = ["svn", "diff", '--patch-compatible']
 
     if self.options.svn_explicit_branches:
       cmd += [self.svn_source_url + "@" + self.rev_start]
@@ -1579,8 +1545,6 @@ class SubversionVCS(VersionControlSystem):
           ]
         )
 
-        LOGGER.info("base_content: {}".format(base_content))
-
         new_content, err, returncode = RunShellWithReturnCodeAndStderr(
           [
             "svn",
@@ -1644,8 +1608,6 @@ class SubversionVCS(VersionControlSystem):
       else:
         get_base = True
 
-      LOGGER.info("get_base: {}".format(get_base))
-
       if get_base:
         if is_binary:
           universal_newlines = False
@@ -1691,8 +1653,6 @@ class SubversionVCS(VersionControlSystem):
     else:
       StatusUpdate("svn status returned unexpected output: %s" % status)
       sys.exit(1)
-
-    #LOGGER.info(pformat((base_content, new_content, is_binary, status[0:5])))
 
     return base_content, new_content, is_binary, status[0:5]
 
@@ -2445,9 +2405,6 @@ def UploadSeparatePatches(issue, rpc_server, patchset, data, options):
     filename = patch[0]
     data = patch[1]
 
-    # LOGGER.info("filename: {}".format(filename))
-    # LOGGER.info("data: {}".format(data))
-
     t = thread_pool.apply_async(UploadFile, args=(filename, data))
     threads.append(t)
 
@@ -2726,8 +2683,6 @@ def RealMain(argv, data=None):
 
   vcs = GuessVCS(options)
 
-  LOGGER.info(vcs)
-
   base = options.base_url
   if isinstance(vcs, SubversionVCS):
     # Guessing the base field is only supported for Subversion.
@@ -2873,14 +2828,6 @@ def RealMain(argv, data=None):
       patches = result
 
   if not options.download_base:
-
-    # LOGGER.info("issue: {}".format(issue))
-    # LOGGER.info("rpc_server: {}".format(rpc_server))
-    # LOGGER.info("patches: {}".format(patches))
-    # LOGGER.info("patchset: {}".format(patchset))
-    # LOGGER.info("options: {}".format(options))
-    # LOGGER.info("files: {}".format(files))
-
     vcs.UploadBaseFiles(issue, rpc_server, patches, patchset, options, files)
 
   payload = {}  # payload for final request
@@ -2890,9 +2837,6 @@ def RealMain(argv, data=None):
       payload["attach_patch"] = "yes"
   if options.issue and message:
     payload["message"] = message
-
-  LOGGER.info("payload: {}".format(payload))
-  LOGGER.info("patchset: {}".format(patchset))
 
   payload = urllib.urlencode(payload)
   response = rpc_server.Send("/" + issue + "/upload_complete/" + (patchset or ""),
